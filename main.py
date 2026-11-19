@@ -29,6 +29,7 @@ app.add_middleware(
 embeddings = GoogleGenerativeAIEmbeddings(
     model="gemini-embedding-001",
     api_key=API_KEY,
+    transport="rest",
 )
 vectorstore = Chroma(
     persist_directory=PERSIST_DIR,
@@ -39,6 +40,7 @@ llm = ChatGoogleGenerativeAI(
     model="gemini-2.5-flash",
     temperature=0,
     api_key=API_KEY,
+    transport="rest",
 )
 
 
@@ -58,6 +60,12 @@ def ask_ric(payload: AskRequest):
         raise HTTPException(status_code=400, detail="La pregunta no puede estar vacía.")
 
     docs = retriever.invoke(question)
+    if not docs:
+        return {
+            "answer": "No encontré información relevante en la base de datos RIC para esa consulta.",
+            "sources": [],
+        }
+
     context = "\n\n---\n\n".join(
         [
             f"[{d.metadata.get('archivo', 'RIC')} - Pág. {d.metadata.get('page', 0) + 1}]\n{d.page_content}"
@@ -75,12 +83,15 @@ Contexto:
 Pregunta: {question}"""
 
     answer = llm.invoke(prompt).content
-    sources = [
-        {
-            "archivo": d.metadata.get("archivo", "RIC"),
-            "pagina": d.metadata.get("page", 0) + 1,
-        }
-        for d in docs
-    ]
+
+    sources = []
+    seen = set()
+    for d in docs:
+        archivo = d.metadata.get("archivo", "RIC")
+        pagina = d.metadata.get("page", 0) + 1
+        key = (archivo, pagina)
+        if key not in seen:
+            seen.add(key)
+            sources.append({"archivo": archivo, "pagina": pagina})
 
     return {"answer": answer, "sources": sources}
