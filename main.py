@@ -13,7 +13,9 @@ from pydantic import BaseModel
 os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
 
 PERSIST_DIR = os.getenv("CHROMA_DIR", "/data/db_ric_local")
-EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-small")
+EMBED_MODEL = os.getenv(
+    "EMBED_MODEL", "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
+)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "llama-3.1-8b-instant")
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
@@ -30,15 +32,22 @@ if not GROQ_API_KEY:
 
 class LocalFastEmbedEmbeddings(Embeddings):
     def __init__(self, model_name: str = EMBED_MODEL):
+        self.model_name = model_name
         self.model = TextEmbedding(model_name=model_name)
 
+    def _prepare(self, texts: list[str], kind: str) -> list[str]:
+        if "e5" in self.model_name.lower():
+            prefix = "passage: " if kind == "doc" else "query: "
+            return [f"{prefix}{t}" for t in texts]
+        return texts
+
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        prefixed = [f"passage: {t}" for t in texts]
-        return [vec.tolist() for vec in self.model.embed(prefixed)]
+        prepared = self._prepare(texts, "doc")
+        return [vec.tolist() for vec in self.model.embed(prepared)]
 
     def embed_query(self, text: str) -> list[float]:
-        prefixed = f"query: {text}"
-        first = next(self.model.embed([prefixed]))
+        prepared = self._prepare([text], "query")
+        first = next(self.model.embed(prepared))
         return first.tolist()
 
 
