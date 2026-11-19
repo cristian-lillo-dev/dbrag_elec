@@ -1,69 +1,32 @@
 import glob
-import json
 import os
-import time
-import urllib.error
-import urllib.request
+from fastembed import TextEmbedding
 from langchain_chroma import Chroma
 from langchain_community.document_loaders import PyMuPDFLoader
 from langchain_core.embeddings import Embeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 
-# En Railway montaremos el Volume en /data; en local puedes usar ./data
-PERSIST_DIR = os.getenv("CHROMA_DIR", "/data/db_ric")
+os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
+PERSIST_DIR = os.getenv("CHROMA_DIR", "/data/db_ric_local")
 PDF_DIR = os.getenv("PDF_DIR", "./pdfs_ric")
-API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
-
-if not API_KEY:
-    raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY o GOOGLE_API_KEY")
+EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-small")
 
 
-class GeminiRestEmbeddings(Embeddings):
-    def __init__(self, api_key: str, model: str = "gemini-embedding-001"):
-        self.api_key = api_key
-        self.model = model
-
-    def _embed_single(self, text: str, max_retries: int = 4) -> list[float]:
-        url = (
-            f"https://generativelanguage.googleapis.com/v1beta/models/"
-            f"{self.model}:embedContent?key={self.api_key}"
-        )
-        payload = json.dumps({"content": {"parts": [{"text": text}]}}).encode("utf-8")
-
-        for attempt in range(max_retries):
-            req = urllib.request.Request(
-                url,
-                data=payload,
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            try:
-                with urllib.request.urlopen(req, timeout=30) as resp:
-                    data = json.loads(resp.read().decode("utf-8"))
-                return data["embedding"]["values"]
-            except urllib.error.HTTPError as exc:
-                if exc.code == 429 and attempt < max_retries - 1:
-                    wait_sec = 5 * (attempt + 1)
-                    print(f"Rate limit (429), reintentando en {wait_sec}s...")
-                    time.sleep(wait_sec)
-                    continue
-                body = exc.read().decode("utf-8", errors="replace")
-                raise RuntimeError(f"Error HTTP {exc.code} en embeddings: {body}") from exc
-
-        raise RuntimeError("No se pudo generar embedding tras varios reintentos.")
+class LocalFastEmbedEmbeddings(Embeddings):
+    def __init__(self, model_name: str = EMBED_MODEL):
+        self.model = TextEmbedding(model_name=model_name)
 
     def embed_documents(self, texts: list[str]) -> list[list[float]]:
-        vectors = []
-        total = len(texts)
-        for i, text in enumerate(texts, start=1):
-            vectors.append(self._embed_single(text))
-            if i % 20 == 0 or i == total:
-                print(f"Procesados {i}/{total} fragmentos...")
-                time.sleep(0.5)
-        return vectors
+        # E5 rinde mejor con prefijo "passage: " al indexar documentos
+        prefixed = [f"passage: {t}" for t in texts]
+        return [vec.tolist() for vec in self.model.embed(prefixed)]
 
     def embed_query(self, text: str) -> list[float]:
-        return self._embed_single(text)
+        # E5 rinde mejor con prefijo "query: " al consultar
+        prefixed = f"query: {text}"
+        first = next(self.model.embed([prefixed]))
+        return first.tolist()
 
 
 def run_ingest():
@@ -87,7 +50,7 @@ def run_ingest():
     chunks = splitter.split_documents(docs)
     print(f"Total fragmentos a vectorizar: {len(chunks)}")
 
-    embeddings = GeminiRestEmbeddings(api_key=API_KEY)
+    embeddings = LocalFastEmbedEmbeddings(model_name=EMBED_MODEL)
     Chroma.from_documents(
         documents=chunks,
         embedding=embeddings,
