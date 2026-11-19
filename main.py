@@ -10,6 +10,7 @@ from pydantic import BaseModel
 
 PERSIST_DIR = os.getenv("CHROMA_DIR", "/data/db_ric")
 API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
+CHAT_MODEL = os.getenv("GEMINI_CHAT_MODEL", "gemini-3.8-flash")
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
@@ -48,10 +49,11 @@ class GeminiRestEmbeddings(Embeddings):
         return self._embed_single(text)
 
 
-def generate_gemini_answer(prompt: str, model: str = "gemini-2.5-flash") -> str:
+def generate_gemini_answer(prompt: str, model: str | None = None) -> str:
+    active_model = model or CHAT_MODEL
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
-        f"{model}:generateContent?key={API_KEY}"
+        f"{active_model}:generateContent?key={API_KEY}"
     )
     body = {
         "contents": [{"parts": [{"text": prompt}]}],
