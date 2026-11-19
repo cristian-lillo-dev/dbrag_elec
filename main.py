@@ -1,5 +1,6 @@
 import json
 import os
+import time
 import urllib.error
 import urllib.request
 from fastapi import FastAPI, HTTPException
@@ -49,7 +50,11 @@ class GeminiRestEmbeddings(Embeddings):
         return self._embed_single(text)
 
 
-def generate_gemini_answer(prompt: str, model: str | None = None) -> str:
+def generate_gemini_answer(
+    prompt: str,
+    model: str | None = None,
+    max_retries: int = 3,
+) -> str:
     active_model = model or CHAT_MODEL
     url = (
         f"https://generativelanguage.googleapis.com/v1beta/models/"
@@ -59,27 +64,44 @@ def generate_gemini_answer(prompt: str, model: str | None = None) -> str:
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {"temperature": 0},
     }
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={"Content-Type": "application/json"},
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=45) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        err_text = exc.read().decode("utf-8", errors="replace")
-        raise HTTPException(
-            status_code=502,
-            detail=f"Error al consultar Gemini ({exc.code}): {err_text}",
-        ) from exc
 
-    candidates = data.get("candidates", [])
-    if not candidates:
-        return "No se obtuvo respuesta del modelo."
-    parts = candidates[0].get("content", {}).get("parts", [])
-    return "".join(p.get("text", "") for p in parts).strip()
+    for attempt in range(max_retries):
+        req = urllib.request.Request(
+            url,
+            data=json.dumps(body).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=60) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            candidates = data.get("candidates", [])
+            if not candidates:
+                return "No se obtuvo respuesta del modelo."
+            parts = candidates[0].get("content", {}).get("parts", [])
+            return "".join(p.get("text", "") for p in parts).strip()
+        except urllib.error.HTTPError as exc:
+            err_text = exc.read().decode("utf-8", errors="replace")
+            if exc.code in (429, 503) and attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise HTTPException(
+                status_code=502,
+                detail=f"Error al consultar Gemini ({exc.code}): {err_text}",
+            ) from exc
+        except (TimeoutError, urllib.error.URLError) as exc:
+            if attempt < max_retries - 1:
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise HTTPException(
+                status_code=504,
+                detail=f"Tiempo de espera agotado al consultar Gemini: {exc}",
+            ) from exc
+
+    raise HTTPException(
+        status_code=502,
+        detail="No se pudo obtener respuesta de Gemini tras varios reintentos.",
+    )
 
 
 app = FastAPI(title="RIC RAG MVP")
@@ -97,7 +119,7 @@ vectorstore = Chroma(
     persist_directory=PERSIST_DIR,
     embedding_function=embeddings,
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
+retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
 
 
 class AskRequest(BaseModel):
@@ -124,13 +146,13 @@ def ask_ric(payload: AskRequest):
 
     context = "\n\n---\n\n".join(
         [
-            f"[{d.metadata.get('archivo', 'RIC')} - Pág. {d.metadata.get('page', 0) + 1}]\n{d.page_content}"
+            f"[{d.metadata.get('archivo', 'RIC')} - Pág. {d.metadata.get('page', 0) + 1}]\n{d.page_content[:1200]}"
             for d in docs
         ]
     )
 
     prompt = f"""Eres un asistente técnico de los Pliegos Técnicos Normativos RIC de la SEC (Chile).
-Responde ÚNICAMENTE con la información del contexto entregado.
+Responde ÚNICAMENTE con la información del contexto entregado, de forma clara y concisa.
 Cita siempre el archivo/RIC y la página. Si el dato no está en el contexto o depende de una tabla/anexo incompleto, dilo claramente sin inventar.
 
 Contexto:
