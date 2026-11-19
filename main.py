@@ -2,15 +2,19 @@ import os
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from langchain_chroma import Chroma
-from langchain_openai import ChatOpenAI, OpenAIEmbeddings
+from langchain_google_genai import ChatGoogleGenerativeAI, GoogleGenerativeAIEmbeddings
 from pydantic import BaseModel
 
 PERSIST_DIR = os.getenv("CHROMA_DIR", "/data/db_ric")
+API_KEY = os.getenv("GEMINI_API_KEY") or os.getenv("GOOGLE_API_KEY")
 ALLOWED_ORIGINS = [
     origin.strip()
     for origin in os.getenv("ALLOWED_ORIGINS", "*").split(",")
     if origin.strip()
 ]
+
+if not API_KEY:
+    raise RuntimeError("Falta la variable de entorno GEMINI_API_KEY o GOOGLE_API_KEY")
 
 app = FastAPI(title="RIC RAG MVP")
 
@@ -22,20 +26,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-embeddings = OpenAIEmbeddings(model="text-embedding-3-small")
+embeddings = GoogleGenerativeAIEmbeddings(
+    model="gemini-embedding-001",
+    api_key=API_KEY,
+)
 vectorstore = Chroma(
     persist_directory=PERSIST_DIR,
     embedding_function=embeddings,
 )
 retriever = vectorstore.as_retriever(search_kwargs={"k": 6})
-llm = ChatOpenAI(model="gpt-4o-mini", temperature=0)
+llm = ChatGoogleGenerativeAI(
+    model="gemini-2.5-flash",
+    temperature=0,
+    api_key=API_KEY,
+)
+
 
 class AskRequest(BaseModel):
     question: str
 
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
 
 @app.post("/api/ric/ask")
 def ask_ric(payload: AskRequest):

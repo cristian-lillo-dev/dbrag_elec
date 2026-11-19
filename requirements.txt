@@ -3,7 +3,7 @@ uvicorn[standard]==0.30.6
 pydantic==2.9.2
 langchain-community==0.3.3
 langchain-text-splitters==0.3.0
-langchain-openai==0.2.3
+langchain-google-genai>=2.0.5
 langchain-chroma==0.1.4
 chromadb==0.5.15
 pymupdf==1.24.13
