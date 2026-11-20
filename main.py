@@ -22,6 +22,9 @@ EMBED_MODEL = os.getenv(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+TOP_K = int(os.getenv("TOP_K", "6"))
+FETCH_K = int(os.getenv("FETCH_K", "20"))
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "1400"))
 
 ALLOWED_ORIGINS = [
     origin.strip()
@@ -31,6 +34,25 @@ ALLOWED_ORIGINS = [
 
 if not GROQ_API_KEY:
     raise RuntimeError("Falta la variable de entorno GROQ_API_KEY")
+
+RIC_PATTERN = re.compile(
+    r"\bric\s*[-_–—]?\s*n?\s*[°º]?\s*[-_–—]?\s*0*(\d+)\b",
+    re.IGNORECASE,
+)
+
+
+def expandir_consulta_ric(question: str) -> str:
+    """Añade alias equivalentes de pliegos RIC para mejorar el matching de la consulta."""
+    numeros = sorted({match.group(1) for match in RIC_PATTERN.finditer(question)})
+    if not numeros:
+        return question
+
+    aliases: list[str] = []
+    for num in numeros:
+        aliases.extend([f"RIC-N{num}", f"RIC N° {num}", f"RIC {num}"])
+
+    aliases_unicos = list(dict.fromkeys(aliases))
+    return f"{question} ({' / '.join(aliases_unicos)})"
 
 
 class LocalFastEmbedEmbeddings(Embeddings):
@@ -55,7 +77,7 @@ class LocalFastEmbedEmbeddings(Embeddings):
         return first.tolist()
 
 
-def _recortar_limpio(texto: str, limite: int = 950) -> str:
+def _recortar_limpio(texto: str, limite: int = MAX_CONTEXT_CHARS) -> str:
     texto = texto.strip()
     if len(texto) <= limite:
         return texto
@@ -68,11 +90,9 @@ def _recortar_limpio(texto: str, limite: int = 950) -> str:
 
 def _limpiar_html_respuesta(raw_text: str) -> str:
     texto = raw_text.strip()
-    # Quita posibles cercas ```html ... ``` si el modelo las incluyó
     texto = re.sub(r"^```(?:html)?\s*", "", texto, flags=re.IGNORECASE)
     texto = re.sub(r"\s*```$", "", texto)
 
-    # Elimina etiquetas peligrosas o de documento completo por seguridad
     texto = re.sub(
         r"</?(?:script|style|iframe|object|embed|link|meta|html|head|body)[^>]*>",
         "",
@@ -80,13 +100,11 @@ def _limpiar_html_respuesta(raw_text: str) -> str:
         flags=re.IGNORECASE,
     )
     texto = re.sub(
-        r"\s+on\w+\s*=\s*(['\"]).*?\1",
+        r"\s+on[a-zA-Z0-9_-]+\s*=\s*(?:\"[^\"]*\"|'[^']*'|[^\s>]+)",
         "",
         texto,
-        flags=re.IGNORECASE,
     )
 
-    # Si no contiene etiquetas HTML básicas, convierte negritas/párrafos simples
     if not re.search(r"<(?:h3|h4|p|ul|ol|li|strong|div)\b", texto, re.IGNORECASE):
         escapado = html.escape(texto)
         escapado = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escapado)
@@ -136,7 +154,7 @@ def generate_groq_answer(
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {GROQ_API_KEY}",
-                "User-Agent": "RIC-RAG-MVP/1.0",
+                "User-Agent": "RIC-RAG-MVP/1.1",
             },
             method="POST",
         )
@@ -191,7 +209,10 @@ vectorstore = Chroma(
     embedding_function=embeddings,
     client_settings=Settings(anonymized_telemetry=False),
 )
-retriever = vectorstore.as_retriever(search_kwargs={"k": 3})
+retriever = vectorstore.as_retriever(
+    search_type="mmr",
+    search_kwargs={"k": TOP_K, "fetch_k": FETCH_K},
+)
 
 
 class AskRequest(BaseModel):
@@ -226,7 +247,8 @@ def ask_ric(payload: AskRequest):
             status_code=400, detail="La pregunta no puede estar vacía."
         )
 
-    docs = retriever.invoke(question)
+    consulta_expandida = expandir_consulta_ric(question)
+    docs = retriever.invoke(consulta_expandida)
     if not docs:
         return {
             "answer": (
@@ -239,7 +261,7 @@ def ask_ric(payload: AskRequest):
     context = "\n\n---\n\n".join([
         (
             f"[{d.metadata.get('archivo', 'RIC')} - Pág."
-            f" {d.metadata.get('page', 0) + 1}]\n{_recortar_limpio(d.page_content, 950)}"
+            f" {d.metadata.get('page', 0) + 1}]\n{_recortar_limpio(d.page_content, MAX_CONTEXT_CHARS)}"
         )
         for d in docs
     ])
