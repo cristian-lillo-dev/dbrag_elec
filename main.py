@@ -22,8 +22,8 @@ EMBED_MODEL = os.getenv(
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 GROQ_CHAT_MODEL = os.getenv("GROQ_CHAT_MODEL", "openai/gpt-oss-120b")
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
-TOP_K = int(os.getenv("TOP_K", "6"))
-FETCH_K = int(os.getenv("FETCH_K", "20"))
+TOP_K = int(os.getenv("TOP_K", "8"))
+FETCH_K = int(os.getenv("FETCH_K", "24"))
 MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "1400"))
 
 ALLOWED_ORIGINS = [
@@ -37,6 +37,11 @@ if not GROQ_API_KEY:
 
 RIC_PATTERN = re.compile(
     r"\bric\s*[-_–—]?\s*n?\s*[°º]?\s*[-_–—]?\s*0*(\d+)\b",
+    re.IGNORECASE,
+)
+
+DEFINICION_PATTERN = re.compile(
+    r"\b(?:qu[eé]\s+es|definici[oó]n(?:\s+de)?|a\s+qu[eé]\s+se\s+llama|qu[eé]\s+significa)\b",
     re.IGNORECASE,
 )
 
@@ -126,9 +131,9 @@ GLOSARIO_TEMAS_RIC: dict[str, str] = {
     "anti-isla": "proteccion anti-isla anti-islanding inversor autogeneracion RIC-N09",
     "net billing": "generacion distribuida net billing ley 20571 21118 autogeneracion TE4 RIC-N09",
     # RIC-N10: Instalaciones de Uso General
-    "enchufe": "enchufe hembra tomacorriente circuito de enchufes 10A 16A 30mA RIC-N10",
+    "enchufe": "enchufe hembra tomacorriente circuito de enchufes 10A 16A 30mA definicion glosario RIC-N10",
     "enchufes": "enchufes tomacorrientes circuito de enchufes 10A 16A 30mA volumenes bano RIC-N10",
-    "tomacorriente": "enchufe hembra tomacorriente circuito de enchufes 10A 16A RIC-N10",
+    "tomacorriente": "enchufe hembra tomacorriente circuito de enchufes 10A 16A definicion glosario RIC-N10",
     "tomacorrientes": "enchufes tomacorrientes circuito de enchufes 10A 16A RIC-N10",
     "alumbrado": "alumbrado circuitos de alumbrado luminaria lux iluminancia RIC-N10",
     "iluminacion": "alumbrado iluminacion luminaria lux UGR IRC RIC-N10",
@@ -193,7 +198,7 @@ def es_consulta_corta(question: str) -> bool:
 
 
 def expandir_consulta_para_busqueda(question: str) -> str:
-    """Enriquece la consulta solo para el retriever usando alias RIC y el glosario técnico."""
+    """Enriquece la consulta solo para el retriever usando alias RIC, definiciones y glosario."""
     partes = [question]
 
     numeros = sorted({match.group(1) for match in RIC_PATTERN.finditer(question)})
@@ -202,6 +207,9 @@ def expandir_consulta_para_busqueda(question: str) -> str:
         for num in numeros:
             aliases.extend([f"RIC-N{num}", f"RIC N° {num}", f"RIC {num}"])
         partes.append(f"({' / '.join(dict.fromkeys(aliases))})")
+
+    if DEFINICION_PATTERN.search(question):
+        partes.append("definicion glosario diccionario concepto")
 
     q_lower = re.sub(r"\s+", " ", question.lower().strip())
     tokens = set(re.findall(r"[a-zA-ZáéíóúñÁÉÍÓÚÑ0-9°º_-]+", q_lower))
@@ -290,8 +298,8 @@ def generate_groq_answer(
 ) -> str:
     active_model = model or GROQ_CHAT_MODEL
     guia_abierta = (
-        "Si la pregunta es una palabra o tema amplio (por ejemplo 'enchufes'), resume de forma ordenada "
-        "las condiciones, circuitos, recintos o requisitos que sí aparezcan en el contexto recuperado. "
+        "Si la pregunta es una palabra, definición o tema amplio (por ejemplo 'enchufes' o 'que es un enchufe'), "
+        "resume de forma ordenada las definiciones, condiciones, circuitos, recintos o requisitos que sí aparezcan en el contexto recuperado. "
         if consulta_abierta
         else ""
     )
@@ -326,7 +334,7 @@ def generate_groq_answer(
             headers={
                 "Content-Type": "application/json",
                 "Authorization": f"Bearer {GROQ_API_KEY}",
-                "User-Agent": "RIC-RAG-MVP/1.3",
+                "User-Agent": "RIC-RAG-MVP/1.4",
             },
             method="POST",
         )
@@ -423,7 +431,7 @@ def ask_ric(payload: AskRequest):
             status_code=400, detail="La pregunta no puede estar vacía."
         )
 
-    corta = es_consulta_corta(question)
+    corta = es_consulta_corta(question) or bool(DEFINICION_PATTERN.search(question))
     consulta_busqueda = expandir_consulta_para_busqueda(question)
     active_retriever = retriever_similarity if corta else retriever_mmr
 
