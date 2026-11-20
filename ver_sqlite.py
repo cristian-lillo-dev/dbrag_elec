@@ -15,12 +15,8 @@ from rich.table import Table
 from rich.traceback import install as install_rich_traceback
 from rich.tree import Tree
 
-# Inicializa Colorama para compatibilidad ANSI en Windows y terminales clásicas
 colorama_init(autoreset=True)
-
-# Activa tracebacks legibles de Rich
 install_rich_traceback(show_locals=False)
-
 console = Console()
 
 
@@ -121,20 +117,26 @@ def mostrar_documentos_ingresados(conn: sqlite3.Connection, db_path: str) -> boo
         try:
             with open(registro_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            archivos = data.get("archivos", {}) or {}
+            for nombre, info in (data.get("archivos") or {}).items():
+                archivos[nombre] = dict(info)
             ultima_act = data.get("ultima_actualizacion_utc")
             modelo_emb = data.get("embed_model")
         except (OSError, json.JSONDecodeError) as exc:
             banner_estado(f"No se pudo leer {registro_path}: {exc}", nivel="warn")
 
-    if not archivos:
-        archivos = _obtener_archivos_desde_sqlite(conn)
+    # Incluye también cualquier archivo presente en embedding_metadata que no figure en el JSON
+    archivos_sqlite = _obtener_archivos_desde_sqlite(conn)
+    for nombre, info_sql in archivos_sqlite.items():
+        if nombre not in archivos:
+            archivos[nombre] = info_sql
+        elif archivos[nombre].get("fragmentos") in (None, "-", 0):
+            archivos[nombre]["fragmentos"] = info_sql["fragmentos"]
 
     if not archivos:
         return False
 
     tabla_docs = Table(
-        title="Documentos ingresados",
+        title=f"Todos los documentos ingresados ({len(archivos)})",
         box=box.ROUNDED,
         border_style="green",
         header_style="bold green",
@@ -143,7 +145,7 @@ def mostrar_documentos_ingresados(conn: sqlite3.Connection, db_path: str) -> boo
     tabla_docs.add_column("Documento / Archivo", style="bold cyan")
     tabla_docs.add_column("Páginas", justify="right", style="yellow")
     tabla_docs.add_column("Fragmentos", justify="right", style="bold white")
-    tabla_docs.add_column("Estado", justify="center")
+    tabla_docs.add_column("Último estado", justify="center")
 
     estilos_estado = {
         "nuevo": "[bold green]nuevo[/bold green]",
@@ -155,7 +157,7 @@ def mostrar_documentos_ingresados(conn: sqlite3.Connection, db_path: str) -> boo
     for idx, (nombre, info) in enumerate(sorted(archivos.items()), start=1):
         paginas = info.get("paginas", "-")
         fragmentos = info.get("fragmentos", "-")
-        estado_raw = str(info.get("estado_ultima_ingesta", "-"))
+        estado_raw = str(info.get("estado_ultima_ingesta", "ingresado"))
         estado_fmt = estilos_estado.get(estado_raw, f"[white]{estado_raw}[/white]")
 
         pag_str = f"{paginas:,}" if isinstance(paginas, int) else str(paginas)
@@ -335,7 +337,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("db_path", help="Ruta al archivo .sqlite o .db")
     parser.add_argument("-t", "--table", help="Nombre de la tabla a inspeccionar")
     parser.add_argument("-s", "--schema", action="store_true", help="Mostrar columnas y DDL de la tabla")
-    parser.add_argument("-d", "--docs", action="store_true", help="Mostrar lista de documentos ingresados")
+    parser.add_argument("-d", "--docs", action="store_true", help="Mostrar todos los documentos ingresados")
     parser.add_argument("-n", "--limit", type=int, default=20, help="Filas máximas a mostrar (default: 20)")
     parser.add_argument("--offset", type=int, default=0, help="Desplazamiento de filas (default: 0)")
     parser.add_argument("--max-len", type=int, default=60, help="Máximo de caracteres por celda (default: 60)")
