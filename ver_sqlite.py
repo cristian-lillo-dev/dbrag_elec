@@ -1,4 +1,5 @@
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -76,6 +77,104 @@ def formatear_valor(valor, max_len: int) -> str:
     return texto
 
 
+def _obtener_archivos_desde_sqlite(conn: sqlite3.Connection) -> dict[str, dict]:
+    tablas = obtener_tablas(conn)
+    if "embedding_metadata" not in tablas:
+        return {}
+
+    cols = {
+        row["name"]
+        for row in conn.execute('PRAGMA table_info("embedding_metadata");').fetchall()
+    }
+    if not {"key", "string_value"}.issubset(cols):
+        return {}
+
+    rows = conn.execute(
+        """
+        SELECT string_value AS archivo, COUNT(*) AS fragmentos
+        FROM embedding_metadata
+        WHERE key = 'archivo' AND string_value IS NOT NULL
+        GROUP BY string_value
+        ORDER BY string_value ASC;
+        """
+    ).fetchall()
+
+    archivos: dict[str, dict] = {}
+    for r in rows:
+        archivos[r["archivo"]] = {
+            "paginas": "-",
+            "fragmentos": r["fragmentos"],
+            "estado_ultima_ingesta": "en_chroma",
+        }
+    return archivos
+
+
+def mostrar_documentos_ingresados(conn: sqlite3.Connection, db_path: str) -> bool:
+    carpeta_db = os.path.dirname(os.path.abspath(db_path))
+    registro_path = os.path.join(carpeta_db, "registro_ingesta.json")
+
+    archivos: dict[str, dict] = {}
+    ultima_act = None
+    modelo_emb = None
+
+    if os.path.exists(registro_path):
+        try:
+            with open(registro_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            archivos = data.get("archivos", {}) or {}
+            ultima_act = data.get("ultima_actualizacion_utc")
+            modelo_emb = data.get("embed_model")
+        except (OSError, json.JSONDecodeError) as exc:
+            banner_estado(f"No se pudo leer {registro_path}: {exc}", nivel="warn")
+
+    if not archivos:
+        archivos = _obtener_archivos_desde_sqlite(conn)
+
+    if not archivos:
+        return False
+
+    tabla_docs = Table(
+        title="Documentos ingresados",
+        box=box.ROUNDED,
+        border_style="green",
+        header_style="bold green",
+    )
+    tabla_docs.add_column("#", style="dim", justify="right", width=4)
+    tabla_docs.add_column("Documento / Archivo", style="bold cyan")
+    tabla_docs.add_column("Páginas", justify="right", style="yellow")
+    tabla_docs.add_column("Fragmentos", justify="right", style="bold white")
+    tabla_docs.add_column("Estado", justify="center")
+
+    estilos_estado = {
+        "nuevo": "[bold green]nuevo[/bold green]",
+        "modificado": "[bold yellow]modificado[/bold yellow]",
+        "sin_cambios": "[dim cyan]sin_cambios[/dim cyan]",
+        "en_chroma": "[cyan]en_chroma[/cyan]",
+    }
+
+    for idx, (nombre, info) in enumerate(sorted(archivos.items()), start=1):
+        paginas = info.get("paginas", "-")
+        fragmentos = info.get("fragmentos", "-")
+        estado_raw = str(info.get("estado_ultima_ingesta", "-"))
+        estado_fmt = estilos_estado.get(estado_raw, f"[white]{estado_raw}[/white]")
+
+        pag_str = f"{paginas:,}" if isinstance(paginas, int) else str(paginas)
+        frag_str = f"{fragmentos:,}" if isinstance(fragmentos, int) else str(fragmentos)
+
+        tabla_docs.add_row(str(idx), nombre, pag_str, frag_str, estado_fmt)
+
+    subtitulo = []
+    if ultima_act:
+        subtitulo.append(f"Actualizado: {ultima_act}")
+    if modelo_emb:
+        subtitulo.append(f"Embeddings: {modelo_emb}")
+
+    console.print(tabla_docs)
+    if subtitulo:
+        console.print(f"[dim]{' | '.join(subtitulo)}[/dim]")
+    return True
+
+
 def mostrar_resumen_y_arbol(conn: sqlite3.Connection, db_path: str) -> None:
     tablas = obtener_tablas(conn)
     if not tablas:
@@ -121,13 +220,18 @@ def mostrar_resumen_y_arbol(conn: sqlite3.Connection, db_path: str) -> None:
                 pk_tag = " [bold green][PK][/bold green]" if c["pk"] else ""
                 nn_tag = " [red]*[/red]" if c["notnull"] else ""
                 tipo = c["type"] or "ANY"
-                rama_tabla.add(f"[cyan]{c['name']}[/cyan] [yellow]({tipo})[/yellow]{nn_tag}{pk_tag}")
+                rama_tabla.add(
+                    f"[cyan]{c['name']}[/cyan] [yellow]({tipo})[/yellow]{nn_tag}{pk_tag}"
+                )
 
             progress.advance(task)
             time.sleep(0.02)
 
     console.print(resumen)
     console.print()
+    mostro_docs = mostrar_documentos_ingresados(conn, db_path)
+    if mostro_docs:
+        console.print()
     console.print(Panel(arbol, title="Árbol de esquema", border_style="cyan", expand=False))
 
 
@@ -231,6 +335,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("db_path", help="Ruta al archivo .sqlite o .db")
     parser.add_argument("-t", "--table", help="Nombre de la tabla a inspeccionar")
     parser.add_argument("-s", "--schema", action="store_true", help="Mostrar columnas y DDL de la tabla")
+    parser.add_argument("-d", "--docs", action="store_true", help="Mostrar lista de documentos ingresados")
     parser.add_argument("-n", "--limit", type=int, default=20, help="Filas máximas a mostrar (default: 20)")
     parser.add_argument("--offset", type=int, default=0, help="Desplazamiento de filas (default: 0)")
     parser.add_argument("--max-len", type=int, default=60, help="Máximo de caracteres por celda (default: 60)")
@@ -250,6 +355,11 @@ def main() -> None:
                 banner_estado("Solo se permiten consultas de lectura (SELECT).", nivel="err")
                 sys.exit(1)
             mostrar_filas(conn, args.table or "query", max_len=args.max_len, query_sql=args.sql)
+            return
+
+        if args.docs:
+            if not mostrar_documentos_ingresados(conn, args.db_path):
+                banner_estado("No se encontraron documentos ingresados.", nivel="warn")
             return
 
         if not args.table:
