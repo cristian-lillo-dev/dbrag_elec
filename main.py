@@ -1,5 +1,7 @@
+import html
 import json
 import os
+import re
 import time
 import urllib.error
 import urllib.request
@@ -53,6 +55,51 @@ class LocalFastEmbedEmbeddings(Embeddings):
         return first.tolist()
 
 
+def _recortar_limpio(texto: str, limite: int = 950) -> str:
+    texto = texto.strip()
+    if len(texto) <= limite:
+        return texto
+    recorte = texto[:limite]
+    ultimo_espacio = recorte.rfind(" ")
+    if ultimo_espacio > int(limite * 0.7):
+        recorte = recorte[:ultimo_espacio]
+    return recorte + "..."
+
+
+def _limpiar_html_respuesta(raw_text: str) -> str:
+    texto = raw_text.strip()
+    # Quita posibles cercas ```html ... ``` si el modelo las incluyó
+    texto = re.sub(r"^```(?:html)?\s*", "", texto, flags=re.IGNORECASE)
+    texto = re.sub(r"\s*```$", "", texto)
+
+    # Elimina etiquetas peligrosas o de documento completo por seguridad
+    texto = re.sub(
+        r"</?(?:script|style|iframe|object|embed|link|meta|html|head|body)[^>]*>",
+        "",
+        texto,
+        flags=re.IGNORECASE,
+    )
+    texto = re.sub(
+        r"\s+on\w+\s*=\s*(['\"]).*?\1",
+        "",
+        texto,
+        flags=re.IGNORECASE,
+    )
+
+    # Si no contiene etiquetas HTML básicas, convierte negritas/párrafos simples
+    if not re.search(r"<(?:h3|h4|p|ul|ol|li|strong|div)\b", texto, re.IGNORECASE):
+        escapado = html.escape(texto)
+        escapado = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", escapado)
+        parrafos = [
+            f"<p>{p.replace(chr(10), '<br>')}</p>"
+            for p in escapado.split("\n\n")
+            if p.strip()
+        ]
+        return "".join(parrafos) if parrafos else "<p>Sin respuesta del modelo.</p>"
+
+    return texto
+
+
 def generate_groq_answer(
     prompt: str,
     model: str | None = None,
@@ -65,12 +112,15 @@ def generate_groq_answer(
             {
                 "role": "system",
                 "content": (
-                    "Eres un asistente técnico de los Pliegos Técnicos"
-                    " Normativos RIC de la SEC (Chile). Responde ÚNICAMENTE con"
-                    " la información del contexto entregado, de forma clara y"
-                    " concisa. Cita siempre el archivo/RIC y la página. Si el"
-                    " dato no está en el contexto o depende de una tabla/anexo"
-                    " incompleto, dilo claramente sin inventar."
+                    "Eres un asistente técnico de los Pliegos Técnicos Normativos RIC de la SEC (Chile). "
+                    "Responde ÚNICAMENTE con la información del contexto entregado, de forma clara, técnica y estructurada. "
+                    "Devuelve EXCLUSIVAMENTE un fragmento HTML válido usando solo las etiquetas: "
+                    "<h3>, <p>, <ul>, <ol>, <li>, <strong> y <br>. "
+                    "NO uses Markdown (nada de **, #, -, ni ```html). "
+                    "NO incluyas <html>, <head> ni <body>. "
+                    "NO repitas la fuente ni el nombre del PDF dentro de cada viñeta, porque las fuentes se muestran aparte. "
+                    "Organiza la respuesta con un <h3> breve del tema y listas <ul>/<ol> con <strong> en los conceptos clave. "
+                    "Si el dato no está en el contexto o depende de una tabla/anexo incompleto, indícalo en un <p> sin inventar."
                 ),
             },
             {"role": "user", "content": prompt},
@@ -95,11 +145,12 @@ def generate_groq_answer(
                 data = json.loads(resp.read().decode("utf-8", errors="replace"))
             choices = data.get("choices", [])
             if not choices:
-                return "No se obtuvo respuesta del modelo."
+                return "<p>No se obtuvo respuesta del modelo.</p>"
             message = choices[0].get("message", {})
-            return (
-                message.get("content") or ""
-            ).strip() or "No se obtuvo respuesta del modelo."
+            contenido = (message.get("content") or "").strip()
+            if not contenido:
+                return "<p>No se obtuvo respuesta del modelo.</p>"
+            return _limpiar_html_respuesta(contenido)
         except urllib.error.HTTPError as exc:
             err_text = exc.read().decode("utf-8", errors="replace")
             if exc.code in (429, 500, 502, 503) and attempt < max_retries - 1:
@@ -179,8 +230,8 @@ def ask_ric(payload: AskRequest):
     if not docs:
         return {
             "answer": (
-                "No encontré información relevante en la base de datos RIC"
-                " para esa consulta."
+                "<p>No encontré información relevante en la base de datos RIC"
+                " para esa consulta.</p>"
             ),
             "sources": [],
         }
@@ -188,17 +239,17 @@ def ask_ric(payload: AskRequest):
     context = "\n\n---\n\n".join([
         (
             f"[{d.metadata.get('archivo', 'RIC')} - Pág."
-            f" {d.metadata.get('page', 0) + 1}]\n{d.page_content[:850]}"
+            f" {d.metadata.get('page', 0) + 1}]\n{_recortar_limpio(d.page_content, 950)}"
         )
         for d in docs
     ])
 
-    prompt = f"""Contexto:
+    prompt = f"""Contexto normativo:
 {context}
 
-Pregunta: {question}"""
+Pregunta del usuario: {question}"""
 
-    answer = generate_groq_answer(prompt)
+    answer_html = generate_groq_answer(prompt)
 
     sources = []
     seen = set()
@@ -210,4 +261,4 @@ Pregunta: {question}"""
             seen.add(key)
             sources.append({"archivo": archivo, "pagina": pagina})
 
-    return {"answer": answer, "sources": sources}
+    return {"answer": answer_html, "sources": sources}
